@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+
+set -u
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+
+if [[ -x "$VENV_PYTHON" ]]; then
+    PYTHON_BIN="$VENV_PYTHON"
+else
+    PYTHON_BIN=$(command -v python3 2>/dev/null || true)
+fi
+
+find_realsense_tool() {
+    local candidate
+
+    candidate=$(command -v rs-enumerate-devices 2>/dev/null || true)
+    if [[ -n "$candidate" ]]; then
+        echo "$candidate"
+        return
+    fi
+
+    for candidate in \
+        /opt/homebrew/bin/rs-enumerate-devices \
+        /usr/local/bin/rs-enumerate-devices \
+        /usr/bin/rs-enumerate-devices; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+}
+
+RS_ENUMERATE_BIN=$(find_realsense_tool)
+
+check_dependencies() {
+    local failed=0
+
+    echo "Dependency check"
+    echo "================"
+
+    if [[ -n "$RS_ENUMERATE_BIN" ]]; then
+        echo "[OK] RealSense SDK: $RS_ENUMERATE_BIN"
+    else
+        echo "[MISSING] RealSense SDK (rs-enumerate-devices)"
+        failed=1
+    fi
+
+    if [[ -n "$PYTHON_BIN" ]] && [[ -x "$PYTHON_BIN" ]]; then
+        echo "[OK] Python: $("$PYTHON_BIN" --version 2>&1)"
+    else
+        echo "[MISSING] Python 3"
+        failed=1
+    fi
+
+    if [[ -n "$PYTHON_BIN" ]] &&
+        "$PYTHON_BIN" -c 'import depthai' >/dev/null 2>&1; then
+        depthai_version=$(
+            "$PYTHON_BIN" -c \
+                'import depthai; print(getattr(depthai, "__version__", "unknown"))'
+        )
+        echo "[OK] DepthAI: $depthai_version"
+    else
+        echo "[MISSING] DepthAI Python package"
+        failed=1
+    fi
+
+    echo
+    if ((failed == 0)); then
+        echo "All required dependencies are installed."
+    else
+        echo "Some dependencies are missing. Run: $SCRIPT_DIR/setup.sh"
+    fi
+
+    return "$failed"
+}
+
+case "${1:-}" in
+    --check-dependencies|--check)
+        check_dependencies
+        exit $?
+        ;;
+    --help|-h)
+        echo "Usage: $0 [--check-dependencies]"
+        echo
+        echo "Without options, scans connected Intel RealSense and Luxonis OAK cameras."
+        exit 0
+        ;;
+esac
+
+# On macOS, RealSense enumeration can require administrator access.
+# The local virtual environment is referenced by its absolute path, so DepthAI
+# remains available after sudo restarts the script.
+if [[ "$(uname -s)" == "Darwin" ]] && [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+names=()
+serials=()
+ports=()
+camera_types=()
+warnings=()
+
+add_camera() {
+    names+=("$1")
+    serials+=("${2:-Not available}")
+    ports+=("${3:-Not available}")
+    camera_types+=("$4")
+}
+
+scan_realsense_cameras() {
+    local output
+    local current_name=""
+    local current_serial=""
+    local current_port=""
+    local line key value
+
+    if [[ -z "$RS_ENUMERATE_BIN" ]]; then
+        warnings+=("RealSense scan skipped: run ./setup.sh to install librealsense.")
+        return
+    fi
+
+    output=$("$RS_ENUMERATE_BIN" 2>/dev/null || true)
+    if [[ -z "$output" ]] || echo "$output" | grep -q "No device detected"; then
+        return
+    fi
+
+    while IFS= read -r line; do
+        key=$(echo "${line%%:*}" | xargs)
+        value=$(echo "${line#*:}" | xargs)
+
+        case "$key" in
+            "Name")
+                if [[ -n "$current_name" ]]; then
+                    add_camera \
+                        "$current_name" \
+                        "$current_serial" \
+                        "$current_port" \
+                        "realsense"
+                fi
+
+                current_name="$value"
+                current_serial=""
+                current_port=""
+                ;;
+
+            "Serial Number")
+                current_serial="$value"
+                ;;
+
+            "Physical Port")
+                current_port="$value"
+                ;;
+        esac
+    done <<< "$output"
+
+    if [[ -n "$current_name" ]]; then
+        add_camera \
+            "$current_name" \
+            "$current_serial" \
+            "$current_port" \
+            "realsense"
+    fi
+}
+
+scan_oak_cameras() {
+    local output
+    local name serial port
+
+    if [[ -z "$PYTHON_BIN" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
+        warnings+=("OAK scan skipped: run ./setup.sh to install Python.")
+        return
+    fi
+
+    if ! "$PYTHON_BIN" -c 'import depthai' >/dev/null 2>&1; then
+        warnings+=("OAK scan skipped: run ./setup.sh to install DepthAI.")
+        return
+    fi
+
+    if ! output=$("$PYTHON_BIN" - 2>/dev/null <<'PY'
+import depthai as dai
+
+
+def first_value(obj, methods=(), attributes=()):
+    for method_name in methods:
+        method = getattr(obj, method_name, None)
+        if callable(method):
+            value = method()
+            if value:
+                return str(value)
+
+    for attribute_name in attributes:
+        value = getattr(obj, attribute_name, None)
+        if value:
+            return str(value)
+
+    return ""
+
+
+def clean(value):
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+for info in dai.Device.getAllAvailableDevices():
+    serial = first_value(
+        info,
+        methods=("getDeviceId", "getMxId"),
+        attributes=("deviceId", "mxid"),
+    )
+    usb_path = first_value(info, attributes=("name",))
+    product_name = ""
+
+    # EEPROM contains the exact product name, for example OAK-D-W.
+    # If the device is busy, discovery and serial output still work.
+    try:
+        with dai.Device(info) as device:
+            calibration = None
+            for method_name in ("readCalibration", "readCalibration2"):
+                method = getattr(device, method_name, None)
+                if callable(method):
+                    calibration = method()
+                    break
+
+            if calibration is not None:
+                eeprom = calibration.getEepromData()
+                product_name = getattr(eeprom, "productName", "") or ""
+    except Exception:
+        pass
+
+    if not product_name:
+        product_name = "Luxonis OAK camera"
+
+    print(
+        "\t".join(
+            (
+                clean(product_name),
+                clean(serial or "Not available"),
+                clean(usb_path or "Not available"),
+            )
+        )
+    )
+PY
+    ); then
+        warnings+=("OAK scan failed: DepthAI could not enumerate devices.")
+        return
+    fi
+
+    while IFS=$'\t' read -r name serial port; do
+        if [[ -n "$name" ]]; then
+            add_camera "$name" "$serial" "$port" "oak"
+        fi
+    done <<< "$output"
+}
+
+get_realsense_location() {
+    local physical_port="$1"
+    local hub_port
+
+    # Examples:
+    # 2-1.1-5 -> 1
+    # 2-2.3-4 -> 3
+    # 2-2.4-3 -> 4
+    hub_port=$(echo "$physical_port" | sed -E 's/.*\.([0-9]+)-.*/\1/')
+
+    case "$hub_port" in
+        1)
+            echo "Hub Port 1 — Right Hand"
+            ;;
+        2)
+            echo "Hub Port 2"
+            ;;
+        3)
+            echo "Hub Port 3"
+            ;;
+        4)
+            echo "Hub Port 4 — Left Hand"
+            ;;
+        *)
+            echo "Unknown port ($physical_port)"
+            ;;
+    esac
+}
+
+scan_realsense_cameras
+scan_oak_cameras
+
+count=${#names[@]}
+
+echo "=========================================="
+echo "        Robot Camera Scanner"
+echo "=========================================="
+echo
+echo "Cameras found: $count"
+echo
+
+if ((count == 0)); then
+    echo "No RealSense or OAK cameras detected."
+    echo
+else
+    for ((i=0; i<count; i++)); do
+        echo "$((i + 1)). ${names[$i]}"
+        echo "   Serial number: ${serials[$i]}"
+
+        if [[ "${camera_types[$i]}" == "realsense" ]]; then
+            echo "   Location: $(get_realsense_location "${ports[$i]}")"
+        elif [[ "${ports[$i]}" != "Not available" ]]; then
+            echo "   USB path: ${ports[$i]}"
+        fi
+
+        echo
+    done
+fi
+
+if ((${#warnings[@]} > 0)); then
+    echo "Warnings:"
+    for warning in "${warnings[@]}"; do
+        echo "   - $warning"
+    done
+    echo
+fi
+
+echo "=========================================="
