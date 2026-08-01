@@ -26,7 +26,7 @@ Windows сейчас не поддерживается, потому что ос
 
 ```bash
 git clone https://github.com/Alexey2512-prog/robot-camera-scanner.git
-cd robot-camera-scanner
+cd ~/robot-camera-scanner
 ```
 
 Запустите установщик:
