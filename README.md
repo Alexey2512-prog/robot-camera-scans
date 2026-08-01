@@ -23,7 +23,7 @@ Windows сейчас не поддерживается, потому что ос
 Склонируйте репозиторий и перейдите в его каталог:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/robot-camera-scanner.git
+git clone https://github.com/Alexey2512-prog/robot-camera-scanner.git
 cd robot-camera-scanner
 ```
 
