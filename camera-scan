@@ -4,6 +4,7 @@ set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python3"
+RS_FRAME_TEST_BIN="$SCRIPT_DIR/.build/rs-frame-test"
 
 if [[ -x "$VENV_PYTHON" ]]; then
     PYTHON_BIN="$VENV_PYTHON"
@@ -65,6 +66,13 @@ check_dependencies() {
         failed=1
     fi
 
+    if [[ -x "$RS_FRAME_TEST_BIN" ]]; then
+        echo "[OK] RealSense FPS/frame-loss test"
+    else
+        echo "[MISSING] RealSense FPS/frame-loss test (run setup.sh)"
+        failed=1
+    fi
+
     echo
     if ((failed == 0)); then
         echo "All required dependencies are installed."
@@ -99,13 +107,122 @@ names=()
 serials=()
 ports=()
 camera_types=()
+connection_speeds=()
+stability_results=()
+frame_test_results=()
 warnings=()
+
+STABILITY_SAMPLES=${CAMERA_SCAN_STABILITY_SAMPLES:-5}
+STABILITY_DELAY_SECONDS=${CAMERA_SCAN_STABILITY_DELAY:-0.25}
+FRAME_TEST_SECONDS=${CAMERA_SCAN_FRAME_TEST_SECONDS:-3}
+
+if ! [[ "$STABILITY_SAMPLES" =~ ^[1-9][0-9]*$ ]] ||
+    ((STABILITY_SAMPLES > 20)); then
+    warnings+=("Invalid CAMERA_SCAN_STABILITY_SAMPLES; using 5 checks.")
+    STABILITY_SAMPLES=5
+fi
+
+if ! [[ "$FRAME_TEST_SECONDS" =~ ^[0-9]+$ ]] ||
+    ((FRAME_TEST_SECONDS > 30)); then
+    warnings+=("Invalid CAMERA_SCAN_FRAME_TEST_SECONDS; using 3 seconds.")
+    FRAME_TEST_SECONDS=3
+fi
 
 add_camera() {
     names+=("$1")
     serials+=("${2:-Not available}")
     ports+=("${3:-Not available}")
     camera_types+=("$4")
+    connection_speeds+=("${5:-Not reported}")
+    stability_results+=("${6:-Not checked}")
+    frame_test_results+=("${7:-Not tested}")
+}
+
+test_realsense_frames() {
+    local serial="$1"
+    local output
+    local actual_fps received dropped drop_percent target_fps
+
+    if ((FRAME_TEST_SECONDS == 0)); then
+        echo "Disabled"
+        return
+    fi
+
+    if [[ -z "$serial" ]] || [[ "$serial" == "Not available" ]]; then
+        echo "Not tested (serial unavailable)"
+        return
+    fi
+
+    if [[ ! -x "$RS_FRAME_TEST_BIN" ]]; then
+        echo "Not tested (run ./setup.sh)"
+        return
+    fi
+
+    if ! output=$("$RS_FRAME_TEST_BIN" \
+        "$serial" \
+        "$FRAME_TEST_SECONDS" 2>&1); then
+        output=$(printf '%s' "$output" | tr '\r\n\t' ' ' | xargs)
+        echo "Failed (${output:-unknown error})"
+        return
+    fi
+
+    IFS=$'\t' read -r \
+        actual_fps received dropped drop_percent target_fps <<< "$output"
+    echo "${actual_fps} FPS (target ${target_fps}); ${received} frames; ${dropped} dropped (${drop_percent}%)"
+}
+
+format_stability_result() {
+    local successful_checks="$1"
+
+    if ((successful_checks == STABILITY_SAMPLES)); then
+        echo "Stable ($successful_checks/$STABILITY_SAMPLES checks)"
+    else
+        echo "Unstable ($successful_checks/$STABILITY_SAMPLES checks)"
+    fi
+}
+
+format_realsense_speed() {
+    local descriptor="$1"
+
+    case "$descriptor" in
+        3|3.*)
+            echo "USB $descriptor (SuperSpeed)"
+            ;;
+        2|2.*)
+            echo "USB $descriptor (High-Speed)"
+            ;;
+        1|1.*)
+            echo "USB $descriptor"
+            ;;
+        ""|"Not available")
+            echo "Not reported"
+            ;;
+        *)
+            echo "USB $descriptor"
+            ;;
+    esac
+}
+
+check_realsense_stability() {
+    local target="$1"
+    local successful_checks=1
+    local probe
+    local sample
+
+    if [[ -z "$target" ]] || [[ "$target" == "Not available" ]]; then
+        echo "Not checked (serial unavailable)"
+        return
+    fi
+
+    for ((sample=1; sample<STABILITY_SAMPLES; sample++)); do
+        sleep "$STABILITY_DELAY_SECONDS"
+        probe=$("$RS_ENUMERATE_BIN" 2>/dev/null || true)
+        if printf '%s\n' "$probe" | grep -Fq -- "$target"; then
+            successful_checks=$((successful_checks + 1))
+        fi
+    done
+
+    format_stability_result "$successful_checks"
 }
 
 scan_realsense_cameras() {
@@ -113,7 +230,10 @@ scan_realsense_cameras() {
     local current_name=""
     local current_serial=""
     local current_port=""
+    local current_usb_speed=""
     local line key value
+    local first_camera_index
+    local i
 
     if [[ -z "$RS_ENUMERATE_BIN" ]]; then
         warnings+=("RealSense scan skipped: run ./setup.sh to install librealsense.")
@@ -124,6 +244,8 @@ scan_realsense_cameras() {
     if [[ -z "$output" ]] || echo "$output" | grep -q "No device detected"; then
         return
     fi
+
+    first_camera_index=${#names[@]}
 
     while IFS= read -r line; do
         key=$(echo "${line%%:*}" | xargs)
@@ -136,12 +258,14 @@ scan_realsense_cameras() {
                         "$current_name" \
                         "$current_serial" \
                         "$current_port" \
-                        "realsense"
+                        "realsense" \
+                        "$(format_realsense_speed "$current_usb_speed")"
                 fi
 
                 current_name="$value"
                 current_serial=""
                 current_port=""
+                current_usb_speed=""
                 ;;
 
             "Serial Number")
@@ -151,6 +275,10 @@ scan_realsense_cameras() {
             "Physical Port")
                 current_port="$value"
                 ;;
+
+            "Usb Type Descriptor"|"USB Type Descriptor")
+                current_usb_speed="$value"
+                ;;
         esac
     done <<< "$output"
 
@@ -159,13 +287,19 @@ scan_realsense_cameras() {
             "$current_name" \
             "$current_serial" \
             "$current_port" \
-            "realsense"
+            "realsense" \
+            "$(format_realsense_speed "$current_usb_speed")"
     fi
+
+    for ((i=first_camera_index; i<${#names[@]}; i++)); do
+        stability_results[$i]=$(check_realsense_stability "${serials[$i]}")
+        frame_test_results[$i]=$(test_realsense_frames "${serials[$i]}")
+    done
 }
 
 scan_oak_cameras() {
     local output
-    local name serial port
+    local name serial port connection_speed stability
 
     if [[ -z "$PYTHON_BIN" ]] || [[ ! -x "$PYTHON_BIN" ]]; then
         warnings+=("OAK scan skipped: run ./setup.sh to install Python.")
@@ -177,8 +311,18 @@ scan_oak_cameras() {
         return
     fi
 
-    if ! output=$("$PYTHON_BIN" - 2>/dev/null <<'PY'
+    if ! output=$("$PYTHON_BIN" - \
+        "$STABILITY_SAMPLES" \
+        "$STABILITY_DELAY_SECONDS" \
+        "$FRAME_TEST_SECONDS" 2>/dev/null <<'PY'
 import depthai as dai
+import sys
+import time
+
+
+SAMPLES = int(sys.argv[1])
+DELAY_SECONDS = float(sys.argv[2])
+FRAME_TEST_SECONDS = int(sys.argv[3])
 
 
 def first_value(obj, methods=(), attributes=()):
@@ -201,41 +345,205 @@ def clean(value):
     return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
 
-for info in dai.Device.getAllAvailableDevices():
+def format_usb_speed(speed):
+    if speed is None:
+        return "Not reported"
+
+    name = str(speed).rsplit(".", 1)[-1]
+    labels = {
+        "LOW": "USB Low-Speed (1.5 Mbit/s)",
+        "FULL": "USB Full-Speed (12 Mbit/s)",
+        "HIGH": "USB 2.0 High-Speed (480 Mbit/s)",
+        "SUPER": "USB 3.x SuperSpeed (5 Gbit/s)",
+        "SUPER_PLUS": "USB 3.x SuperSpeedPlus (10 Gbit/s)",
+        "UNKNOWN": "Not reported",
+    }
+    return labels.get(name, clean(speed))
+
+
+def device_identity(info):
     serial = first_value(
         info,
         methods=("getDeviceId", "getMxId"),
         attributes=("deviceId", "mxid"),
     )
     usb_path = first_value(info, attributes=("name",))
+    return serial, usb_path
+
+
+def test_oak_frames(device):
+    if FRAME_TEST_SECONDS == 0:
+        return "Disabled"
+
+    pipeline_type = getattr(dai, "Pipeline", None)
+    node_namespace = getattr(dai, "node", None)
+    if (
+        pipeline_type is None
+        or not hasattr(pipeline_type, "start")
+        or node_namespace is None
+        or not hasattr(node_namespace, "Camera")
+    ):
+        return "Not tested (DepthAI 3 required)"
+
+    pipeline = None
+    started = False
+    try:
+        pipeline = dai.Pipeline(device)
+        camera = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+        output = camera.requestOutput((640, 400), fps=30)
+        queue = output.createOutputQueue(maxSize=60, blocking=False)
+        pipeline.start()
+        started = True
+
+        startup_deadline = time.monotonic() + 5.0
+        measurement_deadline = None
+        first_arrival = None
+        last_arrival = None
+        previous_sequence = None
+        received = 0
+        dropped = 0
+
+        while True:
+            now = time.monotonic()
+            if measurement_deadline is None:
+                if now >= startup_deadline:
+                    raise RuntimeError("no frames received during startup")
+            elif now >= measurement_deadline:
+                break
+
+            frame = queue.tryGet()
+            if frame is None:
+                time.sleep(0.001)
+                continue
+
+            arrived_at = time.monotonic()
+            if first_arrival is None:
+                first_arrival = arrived_at
+                measurement_deadline = arrived_at + FRAME_TEST_SECONDS
+
+            sequence = frame.getSequenceNum()
+            if (
+                previous_sequence is not None
+                and sequence > previous_sequence + 1
+            ):
+                dropped += sequence - previous_sequence - 1
+            previous_sequence = sequence
+            last_arrival = arrived_at
+            received += 1
+
+        elapsed = (
+            last_arrival - first_arrival
+            if received > 1 and last_arrival is not None
+            else 0.0
+        )
+        actual_fps = (received - 1) / elapsed if elapsed > 0.0 else 0.0
+        expected_total = received + dropped
+        drop_percent = (
+            100.0 * dropped / expected_total if expected_total else 0.0
+        )
+        return (
+            f"{actual_fps:.1f} FPS (target 30); {received} frames; "
+            f"{dropped} dropped ({drop_percent:.1f}%)"
+        )
+    except Exception as exc:
+        return f"Failed ({clean(exc)})"
+    finally:
+        if pipeline is not None and started:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
+
+initial_infos = list(dai.Device.getAllAvailableDevices())
+records = []
+
+for info in initial_infos:
+    serial, usb_path = device_identity(info)
     product_name = ""
+    usb_speed = "Not reported"
+    frame_test = "Not tested (device unavailable)"
 
     # EEPROM contains the exact product name, for example OAK-D-W.
     # If the device is busy, discovery and serial output still work.
     try:
         with dai.Device(info) as device:
-            calibration = None
-            for method_name in ("readCalibration", "readCalibration2"):
-                method = getattr(device, method_name, None)
-                if callable(method):
-                    calibration = method()
-                    break
+            try:
+                get_usb_speed = getattr(device, "getUsbSpeed", None)
+                if callable(get_usb_speed):
+                    usb_speed = format_usb_speed(get_usb_speed())
+            except Exception:
+                pass
 
-            if calibration is not None:
-                eeprom = calibration.getEepromData()
-                product_name = getattr(eeprom, "productName", "") or ""
+            try:
+                calibration = None
+                for method_name in ("readCalibration", "readCalibration2"):
+                    method = getattr(device, method_name, None)
+                    if callable(method):
+                        calibration = method()
+                        break
+
+                if calibration is not None:
+                    eeprom = calibration.getEepromData()
+                    product_name = getattr(eeprom, "productName", "") or ""
+            except Exception:
+                pass
+
+            frame_test = test_oak_frames(device)
     except Exception:
         pass
 
     if not product_name:
         product_name = "Luxonis OAK camera"
 
+    records.append(
+        {
+            "product_name": product_name,
+            "serial": serial or "Not available",
+            "usb_path": usb_path or "Not available",
+            "usb_speed": usb_speed,
+            "frame_test": frame_test,
+            "successful_checks": 1,
+        }
+    )
+
+
+for _ in range(1, SAMPLES):
+    time.sleep(DELAY_SECONDS)
+    try:
+        available = [device_identity(info) for info in dai.Device.getAllAvailableDevices()]
+    except Exception:
+        available = []
+
+    available_serials = {serial for serial, _ in available if serial}
+    available_paths = {path for _, path in available if path}
+
+    for record in records:
+        found = (
+            record["serial"] != "Not available"
+            and record["serial"] in available_serials
+        ) or (
+            record["usb_path"] != "Not available"
+            and record["usb_path"] in available_paths
+        )
+        if found:
+            record["successful_checks"] += 1
+
+
+for record in records:
+    successful = record["successful_checks"]
+    status = "Stable" if successful == SAMPLES else "Unstable"
+    stability = f"{status} ({successful}/{SAMPLES} checks)"
+
     print(
         "\t".join(
             (
-                clean(product_name),
-                clean(serial or "Not available"),
-                clean(usb_path or "Not available"),
+                clean(record["product_name"]),
+                clean(record["serial"]),
+                clean(record["usb_path"]),
+                clean(record["usb_speed"]),
+                clean(stability),
+                clean(record["frame_test"]),
             )
         )
     )
@@ -245,9 +553,17 @@ PY
         return
     fi
 
-    while IFS=$'\t' read -r name serial port; do
+    while IFS=$'\t' read -r \
+        name serial port connection_speed stability frame_test; do
         if [[ -n "$name" ]]; then
-            add_camera "$name" "$serial" "$port" "oak"
+            add_camera \
+                "$name" \
+                "$serial" \
+                "$port" \
+                "oak" \
+                "$connection_speed" \
+                "$stability" \
+                "$frame_test"
         fi
     done <<< "$output"
 }
@@ -300,6 +616,9 @@ else
     for ((i=0; i<count; i++)); do
         echo "$((i + 1)). ${names[$i]}"
         echo "   Serial number: ${serials[$i]}"
+        echo "   Connection speed: ${connection_speeds[$i]}"
+        echo "   Stability: ${stability_results[$i]}"
+        echo "   Frame test: ${frame_test_results[$i]}"
 
         if [[ "${camera_types[$i]}" == "realsense" ]]; then
             echo "   Location: $(get_realsense_location "${ports[$i]}")"

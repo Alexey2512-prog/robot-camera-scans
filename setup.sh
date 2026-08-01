@@ -4,6 +4,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 VENV_DIR="$SCRIPT_DIR/.venv"
+BUILD_DIR="$SCRIPT_DIR/.build"
+RS_FRAME_TEST_SOURCE="$SCRIPT_DIR/tools/rs-frame-test.cpp"
+RS_FRAME_TEST_BIN="$BUILD_DIR/rs-frame-test"
 REQUIREMENTS_FILE="$SCRIPT_DIR/requirements.txt"
 ASSUME_YES=0
 
@@ -134,6 +137,8 @@ install_linux_prerequisites() {
     command -v curl >/dev/null 2>&1 || packages+=("curl")
     command -v gpg >/dev/null 2>&1 || packages+=("gnupg")
     command -v lsb_release >/dev/null 2>&1 || packages+=("lsb-release")
+    command -v c++ >/dev/null 2>&1 || packages+=("build-essential")
+    command -v pkg-config >/dev/null 2>&1 || packages+=("pkg-config")
 
     if ((${#packages[@]} > 0)); then
         log "Installing Linux prerequisites: ${packages[*]}"
@@ -152,7 +157,8 @@ install_linux_realsense() {
     local repo_file="/etc/apt/sources.list.d/librealsense.list"
     local repo_line
 
-    if command -v rs-enumerate-devices >/dev/null 2>&1; then
+    if command -v rs-enumerate-devices >/dev/null 2>&1 &&
+        pkg-config --exists realsense2 2>/dev/null; then
         log "Intel RealSense SDK is already installed"
         return
     fi
@@ -175,7 +181,10 @@ install_linux_realsense() {
 
     log "Installing Intel RealSense SDK and kernel support"
     sudo apt-get update
-    sudo apt-get install -y librealsense2-utils librealsense2-dkms
+    sudo apt-get install -y \
+        librealsense2-utils \
+        librealsense2-dkms \
+        librealsense2-dev
 }
 
 install_linux_oak_udev_rule() {
@@ -225,6 +234,46 @@ install_python_dependencies() {
         -r "$REQUIREMENTS_FILE"
 }
 
+build_realsense_frame_test() {
+    local librealsense_prefix
+    local cflags
+    local libraries
+
+    [[ -f "$RS_FRAME_TEST_SOURCE" ]] ||
+        fail "RealSense frame-test source is missing: $RS_FRAME_TEST_SOURCE"
+    command -v c++ >/dev/null 2>&1 ||
+        fail "A C++ compiler is required to build the RealSense frame test."
+
+    mkdir -p "$BUILD_DIR"
+    log "Building the RealSense FPS/frame-loss test"
+
+    case "$(uname -s)" in
+        Darwin)
+            librealsense_prefix=$(brew --prefix librealsense)
+            c++ -std=c++17 -O2 \
+                "$RS_FRAME_TEST_SOURCE" \
+                -I"$librealsense_prefix/include" \
+                -L"$librealsense_prefix/lib" \
+                -Wl,-rpath,"$librealsense_prefix/lib" \
+                -lrealsense2 \
+                -o "$RS_FRAME_TEST_BIN"
+            ;;
+        Linux)
+            pkg-config --exists realsense2 ||
+                fail "librealsense2-dev is required to build the frame test."
+            cflags=$(pkg-config --cflags realsense2)
+            libraries=$(pkg-config --libs realsense2)
+            # shellcheck disable=SC2086
+            c++ -std=c++17 -O2 $cflags \
+                "$RS_FRAME_TEST_SOURCE" \
+                $libraries \
+                -o "$RS_FRAME_TEST_BIN"
+            ;;
+    esac
+
+    chmod +x "$RS_FRAME_TEST_BIN"
+}
+
 verify_installation() {
     local failed=0
 
@@ -248,6 +297,13 @@ verify_installation() {
         failed=1
     fi
 
+    if [[ -x "$RS_FRAME_TEST_BIN" ]]; then
+        echo "[OK] RealSense FPS/frame-loss test"
+    else
+        echo "[FAILED] RealSense FPS/frame-loss test"
+        failed=1
+    fi
+
     if ((failed != 0)); then
         fail "Dependency verification failed. See README.md troubleshooting."
     fi
@@ -268,6 +324,7 @@ case "$(uname -s)" in
 esac
 
 install_python_dependencies
+build_realsense_frame_test
 chmod +x "$SCRIPT_DIR/camera-scan" "$SCRIPT_DIR/setup.sh"
 verify_installation
 
