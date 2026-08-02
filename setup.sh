@@ -279,6 +279,13 @@ verify_installation() {
 
     log "Verifying installation"
 
+    if [[ -f "$SCRIPT_DIR/scanner.py" ]]; then
+        echo "[OK] scanner.py"
+    else
+        echo "[FAILED] scanner.py"
+        failed=1
+    fi
+
     if command -v rs-enumerate-devices >/dev/null 2>&1; then
         echo "[OK] rs-enumerate-devices"
     else
@@ -327,6 +334,9 @@ install_python_dependencies
 build_realsense_frame_test
 chmod +x "$SCRIPT_DIR/camera-scan" "$SCRIPT_DIR/setup.sh"
 verify_installation
+
+log "Running unit tests"
+"$VENV_DIR/bin/python3" -m unittest discover -s "$SCRIPT_DIR/tests" -v
 
 echo
 echo "Setup complete."

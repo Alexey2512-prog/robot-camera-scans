@@ -9,7 +9,8 @@
 номером считается уникальный DeviceID/MX ID. Для RealSense дополнительно
 определяется логическое расположение по USB-порту хаба. Сканер также показывает
 согласованный режим USB, результат проверки стабильности, фактический FPS и
-потери кадров в коротком видеопотоке.
+потери кадров в коротком видеопотоке. Дополнительно рассчитываются jitter,
+интервалы между кадрами и итоговый статус здоровья камеры.
 
 ## Поддерживаемые системы
 
@@ -25,8 +26,8 @@ Windows сейчас не поддерживается, потому что ос
 Склонируйте репозиторий и перейдите в его каталог:
 
 ```bash
-git clone https://github.com/Alexey2512-prog/robot-camera-scanner.git
-cd ~/robot-camera-scanner
+git clone https://github.com/Alexey2512-prog/robot-camera-scans.git
+cd robot-camera-scans
 ```
 
 Запустите установщик:
@@ -49,8 +50,40 @@ chmod +x setup.sh camera-scan
 ./camera-scan
 ```
 
+Параллельный стресс-тест всех камер на общей USB-шине:
+
+```bash
+./camera-scan --parallel --duration 10 --samples 10
+```
+
+Сохранить машиночитаемый отчёт:
+
+```bash
+./camera-scan --parallel --output reports/cameras.json
+./camera-scan --json
+```
+
 На macOS сканер может запросить пароль администратора. Пароль вводится самим
 пользователем в системный `sudo`; скрипт его не сохраняет.
+
+## Основные параметры
+
+```text
+--duration SECONDS       длительность потокового теста, 0–30 секунд
+--samples COUNT          число проверок стабильности, 1–20
+--parallel               тестировать все камеры одновременно
+--camera all|realsense|oak
+                         ограничить проверку одним семейством
+--json                   вывести JSON вместо текста
+--output FILE            сохранить JSON-отчёт в файл
+--check-dependencies     проверить окружение без обращения к камерам
+```
+
+Полная справка:
+
+```bash
+./camera-scan --help
+```
 
 ## Что устанавливает setup.sh
 
@@ -91,9 +124,8 @@ Python из этого окружения по абсолютному пути, 
 Dependency check
 ================
 [OK] RealSense SDK: /opt/homebrew/bin/rs-enumerate-devices
-[OK] Python: Python 3.x.x
 [OK] DepthAI: 3.x.x
-[OK] RealSense FPS/frame-loss test
+[OK] RealSense FPS/frame-loss helper
 
 All required dependencies are installed.
 ```
@@ -105,21 +137,32 @@ All required dependencies are installed.
         Robot Camera Scanner
 ==========================================
 
+Overall status: WARNING
+Frame-test mode: parallel
 Cameras found: 2
 
 1. Intel RealSense D435
+   Type: realsense
    Serial number: 123456789
+   Health: OK
    Connection speed: USB 3.2 (SuperSpeed)
    Stability: Stable (5/5 checks)
    Frame test: 29.9 FPS (target 30); 90 frames; 0 dropped (0.0%)
+   Timing: interval p95 34.1 ms; jitter p95 1.2 ms; max gap 35.0 ms
+   Max consecutive drops: 0
    Location: Hub Port 4 — Left Hand
 
 2. OAK-D-W
+   Type: oak
    Serial number: 18443010ABCDEF0000
+   Health: WARNING
    Connection speed: USB 3.x SuperSpeed (5 Gbit/s)
    Stability: Stable (5/5 checks)
    Frame test: 29.8 FPS (target 30); 89 frames; 1 dropped (1.1%)
+   Timing: interval p95 35.2 ms; jitter p95 1.7 ms; max gap 67.0 ms
+   Max consecutive drops: 1
    USB path: 1.2.3
+   - frame loss is 1.1%
 
 ==========================================
 ```
@@ -140,7 +183,7 @@ Cameras found: 2
 Количество проверок можно изменить от 1 до 20:
 
 ```bash
-CAMERA_SCAN_STABILITY_SAMPLES=10 ./camera-scan
+./camera-scan --samples 10
 ```
 
 Эта быстрая проверка подтверждает стабильность обнаружения USB-устройства. Она
@@ -165,24 +208,64 @@ Frame test: 29.9 FPS (target 30); 90 frames; 2 dropped (2.2%)
 ```
 
 Фактический FPS вычисляется по времени прихода кадров. Потери определяются по
-разрывам в sequence number, который выдаёт камера. Тесты камер запускаются
-последовательно, чтобы они не конкурировали друг с другом за USB во время
-измерения.
+разрывам в sequence number, который выдаёт камера. Также выводятся:
+
+- `interval p95` — 95-й перцентиль интервала между кадрами;
+- `jitter p95` — 95-й перцентиль отклонения интервала от медианы;
+- `max gap` — самый длинный промежуток без нового кадра;
+- `Max consecutive drops` — максимальная серия потерянных кадров;
+- `Host latency p95` — оценка задержки OAK, если timestamp доступен.
+
+По умолчанию камеры тестируются последовательно. Флаг `--parallel` запускает
+их одновременно и выявляет нехватку полосы общего USB-контроллера.
 
 Изменить длительность теста можно в диапазоне от 1 до 30 секунд:
 
 ```bash
-CAMERA_SCAN_FRAME_TEST_SECONDS=10 ./camera-scan
+./camera-scan --duration 10
 ```
 
 Отключить потоковый тест и оставить только обнаружение камер:
 
 ```bash
-CAMERA_SCAN_FRAME_TEST_SECONDS=0 ./camera-scan
+./camera-scan --duration 0
 ```
 
 Короткий тест помогает быстро найти проблемы, но не гарантирует отсутствие
 редких потерь. Для диагностики плавающей неисправности используйте 10–30 секунд.
+
+## Статусы здоровья и коды завершения
+
+Каждая камера и весь запуск получают статус:
+
+- `OK` — проверки прошли без замечаний;
+- `WARNING` — потери ≥0,5%, FPS ниже 95% цели, jitter p95 ≥5 мс,
+  неполная стабильность или USB 2.0;
+- `FAILED` — потери ≥5%, FPS ниже 80% цели, jitter p95 ≥15 мс,
+  поток не открылся либо камера часто пропадает.
+
+Коды завершения подходят для CI, systemd и ROS-скриптов:
+
+- `0` — `OK`;
+- `1` — `WARNING`;
+- `2` — `FAILED`, камеры не найдены или отсутствуют зависимости.
+
+## JSON-отчёт
+
+Вывести только JSON в stdout:
+
+```bash
+./camera-scan --parallel --duration 10 --json
+```
+
+Сохранить JSON и оставить обычный текст в терминале:
+
+```bash
+./camera-scan --parallel --output reports/cameras.json
+```
+
+Отчёт содержит конфигурацию запуска, общий статус, метрики каждой камеры,
+причины `WARNING`/`FAILED` и версию схемы. Каталог `reports/` исключён из Git.
 
 ## Ручная установка на macOS
 
@@ -310,7 +393,7 @@ lsusb | grep 03e7
 5. Запустите расширенную проверку:
 
 ```bash
-CAMERA_SCAN_STABILITY_SAMPLES=10 ./camera-scan
+./camera-scan --samples 10
 ```
 
 Если `Connection speed` показывает USB 2.0 вместо USB 3, чаще всего причина в
@@ -325,7 +408,7 @@ CAMERA_SCAN_STABILITY_SAMPLES=10 ./camera-scan
 5. Повторите десятисекундный тест:
 
 ```bash
-CAMERA_SCAN_FRAME_TEST_SECONDS=10 ./camera-scan
+./camera-scan --duration 10
 ```
 
 Небольшое отклонение, например 29.8 вместо 30 FPS, нормально для измерения по
@@ -401,28 +484,27 @@ lsusb
 ## Структура проекта
 
 ```text
-robot-camera-scanner/
-├── camera-scan       # основной сканер
+robot-camera-scans/
+├── camera-scan       # Bash launcher и sudo для macOS
+├── scanner.py        # обнаружение, метрики, JSON и статусы
 ├── setup.sh          # автоматическая установка и проверка
 ├── requirements.txt  # Python-зависимости
 ├── tools/
 │   └── rs-frame-test.cpp  # потоковый тест RealSense
+├── tests/
+│   └── test_scanner.py    # unit-тесты парсеров, метрик и статусов
+├── .github/workflows/
+│   └── ci.yml             # CI на Ubuntu и macOS
 ├── README.md
 └── .gitignore
 ```
 
-## Публикация на GitHub
+## Разработка
 
-Перед публикацией замените `YOUR_USERNAME` в команде клонирования выше на имя
-вашего GitHub-аккаунта. Затем:
+Запустить unit-тесты локально:
 
 ```bash
-git init
-git add .
-git commit -m "Initial camera scanner release"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/robot-camera-scanner.git
-git push -u origin main
+python3 -m unittest discover -s tests -v
 ```
 
-Перед открытой публикацией выберите лицензию проекта и добавьте файл `LICENSE`.
+GitHub Actions выполняет Bash-проверки и Python unit-тесты на Ubuntu и macOS.

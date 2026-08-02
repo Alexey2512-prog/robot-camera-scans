@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Bash syntax
+        run: |
+          bash -n camera-scan
+          bash -n setup.sh
+      - name: Run Python unit tests
+        run: python3 -m unittest discover -s tests -v
